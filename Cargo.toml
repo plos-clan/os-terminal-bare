@@ -3,6 +3,10 @@ name = "os-terminal-bare"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+
 [features]
 default = ["fbdev"]
 fbdev = []
