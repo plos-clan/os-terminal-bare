@@ -3,6 +3,14 @@ name = "os-terminal-bare"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["fbdev"]
+fbdev = []
+
+[profile.release]
+lto = "thin"
+opt-level = "z"
+
 [dependencies]
 anyhow = "1.0.101"
 evdev = "0.13.2"
@@ -15,9 +23,3 @@ keycode = "1.0.0"
 [dependencies.nix]
 version = "0.31.1"
 features = ["term", "process", "fs"]
-
-[target.'cfg(feature = "fbdev")'.dependencies]
-
-[features]
-default = ["fbdev"]
-fbdev = []

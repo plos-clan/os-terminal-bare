@@ -1,11 +1,9 @@
 use std::ffi::CString;
-use std::os::fd::AsFd;
-use std::os::unix::io::AsRawFd;
-use std::sync::mpsc::channel;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{Arc, Mutex};
 use std::{env, process};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use evdev::{Device, EventSummary};
 use keycode::KeyMap;
 use nix::errno::Errno;
@@ -20,29 +18,29 @@ use crate::backends::Display;
 pub mod backends;
 
 const DISPLAY_SIZE: (usize, usize) = (1024, 768);
+const VT_GETMODE: i32 = 0x5601;
+const VT_SETMODE: i32 = 0x5602;
 
 fn main() -> Result<()> {
-    match unsafe { forkpty(None, None) } {
-        Ok(ForkptyResult::Child) => {
+    match unsafe { forkpty(None, None) }? {
+        ForkptyResult::Child => {
             let shell = env::var("SHELL").unwrap_or("/bin/sh".into());
-            let _ = execvp::<CString>(&CString::new(shell)?, &[]);
+            let c_shell = CString::new(shell).context("Invalid SHELL path")?;
+            execvp::<CString>(&c_shell, &[]).context("Failed to exec shell")?;
+            unreachable!();
         }
-        Ok(ForkptyResult::Parent { child, master }) => {
-            let _ = child;
-
-            let (flush_sender, flush_receiver) = channel();
-            let (ansi_sender, ansi_receiver) = channel();
-
+        ForkptyResult::Parent { child: _, master } => {
             let display = Display::new();
-
             let mut terminal = Terminal::new(display);
+
             terminal.set_auto_flush(false);
             terminal.set_scroll_speed(5);
             terminal.set_color_cache_size(4096);
-            terminal.set_pty_writer({
-                let ansi_sender = ansi_sender.clone();
-                Box::new(move |data| ansi_sender.send(data.to_string()).unwrap())
-            });
+
+            let master_writer = master.try_clone()?;
+            terminal.set_pty_writer(Box::new(move |data| {
+                let _ = write(master_writer.as_fd(), data.as_bytes());
+            }));
 
             let font_buffer = include_bytes!("../assets/FiraCodeNotoSans.ttf");
             let font_manager = TrueTypeFont::new(10.0, font_buffer).with_subpixel(true);
@@ -55,92 +53,73 @@ fn main() -> Result<()> {
                 ws_xpixel: DISPLAY_SIZE.0 as u16,
                 ws_ypixel: DISPLAY_SIZE.1 as u16,
             };
-
             unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &win_size) };
 
             let terminal = Arc::new(Mutex::new(terminal));
 
-            let master_clone = master.try_clone()?;
-            let terminal_clone = terminal.clone();
-            let flush_sender_clone = flush_sender.clone();
+            let master_reader = master.try_clone()?;
+            let term_reader = terminal.clone();
             std::thread::spawn(move || {
-                let mut temp = [0u8; 4096];
+                let mut buf = [0u8; 4096];
                 loop {
-                    match read(master_clone.as_fd(), &mut temp) {
+                    match read(master_reader.as_fd(), &mut buf) {
                         Ok(n) if n > 0 => {
-                            terminal_clone.lock().unwrap().process(&temp[..n]);
-                            flush_sender_clone.send(()).unwrap();
+                            let mut term = term_reader.lock().unwrap();
+                            term.process(&buf[..n]);
+                            term.flush();
                         }
                         Ok(_) => break,
                         Err(Errno::EIO) => process::exit(0),
                         Err(e) => {
-                            eprintln!("Error reading from PTY: {:?}", e);
-                            process::exit(1)
+                            eprintln!("PTY read error: {:?}", e);
+                            process::exit(1);
                         }
                     }
                 }
             });
 
-            #[allow(unused)]
-            #[derive(Default)]
+            #[derive(Default, Debug)]
             #[repr(C)]
             struct VtMode {
-                pub mode: u8,
-                pub waitv: u8,
-                pub relsig: u16,
-                pub acqsig: u16,
-                pub frsig: u16,
+                mode: u8,
+                waitv: u8,
+                relsig: u16,
+                acqsig: u16,
+                frsig: u16,
             }
-            let mut vt: VtMode = VtMode::default();
+            let mut vt = VtMode::default();
             unsafe {
-                ioctl(1, 0x5601, &mut vt as *mut _);
+                ioctl(1, VT_GETMODE, &mut vt as *mut _);
                 vt.mode = 1;
-                ioctl(1, 0x5602, &mut vt as *mut _);
+                ioctl(1, VT_SETMODE, &mut vt as *mut _);
             }
 
-            std::thread::spawn(move || {
-                while let Ok(key) = ansi_receiver.recv() {
-                    write(master.as_fd(), key.as_bytes()).unwrap();
-                }
-            });
+            let mut evdev = Device::open("/dev/input/event0")?;
 
-            let terminal_clone = terminal.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if let Ok(_) = flush_receiver.recv() {
-                        terminal_clone.lock().unwrap().flush();
-                    }
-                }
-            });
-
-            let mut evdev = Device::open("/dev/input/event0").expect("Failed to find keyboard");
             loop {
-                for event in evdev.fetch_events().expect("Failed to read events") {
-                    match event.destructure() {
-                        EventSummary::Key(_event, code, press) => {
-                            if let Ok(keymap) =
-                                KeyMap::from_key_mapping(keycode::KeyMapping::Evdev(code.code()))
-                            {
-                                // Windows scancode is 16-bit extended scancode
-                                let mut scancode = keymap.win;
-                                if press == 0 {
-                                    scancode += 0x80;
-                                }
-                                if scancode >= 0xe000 {
-                                    terminal.lock().unwrap().handle_keyboard(0xe0);
-                                    scancode -= 0xe000;
-                                }
-                                terminal.lock().unwrap().handle_keyboard(scancode as u8);
-                                flush_sender.send(()).unwrap();
+                for event in evdev.fetch_events()? {
+                    if let EventSummary::Key(_, code, press) = event.destructure() {
+                        if let Ok(keymap) =
+                            KeyMap::from_key_mapping(keycode::KeyMapping::Evdev(code.code()))
+                        {
+                            let mut term = terminal.lock().unwrap();
+
+                            let mut scancode = keymap.win;
+                            if press == 0 {
+                                scancode += 0x80;
                             }
+
+                            if scancode >= 0xe000 {
+                                term.handle_keyboard(0xe0);
+                                scancode -= 0xe000;
+                            }
+
+                            term.handle_keyboard(scancode as u8);
+                            term.flush();
                         }
-                        _ => {}
                     }
                 }
             }
         }
-        Err(_) => eprintln!("Fork failed"),
     }
-
-    Ok(())
 }
