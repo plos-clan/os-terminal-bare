@@ -12,8 +12,10 @@ default = ["fbdev"]
 fbdev = []
 
 [profile.release]
-lto = "thin"
-opt-level = "z"
+lto = true
+opt-level = 3
+panic = "abort"
+codegen-units = 1
 
 [dependencies]
 anyhow = "1.0.101"
