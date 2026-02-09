@@ -1,8 +1,4 @@
-use std::ffi::CString;
-use std::os::fd::{AsFd, AsRawFd};
-use std::sync::{Arc, Mutex};
-use std::{env, process};
-
+use crate::backends::Display;
 use anyhow::{Context, Result};
 use evdev::{Device, EventSummary};
 use keycode::KeyMap;
@@ -12,10 +8,14 @@ use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::unistd::{execvp, read, write};
 use os_terminal::Terminal;
 use os_terminal::font::TrueTypeFont;
+use std::ffi::CString;
+use std::os::fd::{AsFd, AsRawFd};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, process, thread};
 
-use crate::backends::Display;
-
-pub mod backends;
+mod backends;
 
 const DISPLAY_SIZE: (usize, usize) = (1024, 768);
 const VT_GETMODE: i32 = 0x5601;
@@ -57,28 +57,32 @@ fn main() -> Result<()> {
 
             let terminal = Arc::new(Mutex::new(terminal));
 
+            let (flush_sender, flush_receiver) = channel();
             let master_reader = master.try_clone()?;
-            let term_reader = terminal.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
+            let terminal_clone = terminal.clone();
+            let flush_sender_clone = flush_sender.clone();
+
+            thread::spawn(move || {
+                let mut temp = [0u8; 16384];
                 loop {
-                    match read(master_reader.as_fd(), &mut buf) {
+                    match read(master_reader.as_fd(), &mut temp) {
                         Ok(n) if n > 0 => {
-                            let mut term = term_reader.lock().unwrap();
-                            term.process(&buf[..n]);
-                            term.flush();
+                            terminal_clone.lock().unwrap().process(&temp[..n]);
+                            if flush_sender_clone.send(()).is_err() {
+                                break;
+                            }
                         }
                         Ok(_) => break,
                         Err(Errno::EIO) => process::exit(0),
                         Err(e) => {
-                            eprintln!("PTY read error: {:?}", e);
-                            process::exit(1);
+                            eprintln!("Error reading from PTY: {:?}", e);
+                            process::exit(1)
                         }
                     }
                 }
             });
 
-            #[derive(Default, Debug)]
+            #[derive(Default)]
             #[repr(C)]
             struct VtMode {
                 mode: u8,
@@ -94,30 +98,54 @@ fn main() -> Result<()> {
                 ioctl(1, VT_SETMODE, &mut vt as *mut _);
             }
 
-            let mut evdev = Device::open("/dev/input/event0")?;
+            let terminal_clone = terminal.clone();
+            thread::spawn(move || {
+                let mut last_flush = Instant::now();
+                let frame_interval = Duration::from_millis(16);
 
+                loop {
+                    if flush_receiver.recv().is_err() {
+                        break;
+                    }
+
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_flush);
+                    if elapsed < frame_interval {
+                        thread::sleep(frame_interval - elapsed);
+                    }
+
+                    while let Ok(_) = flush_receiver.try_recv() {}
+
+                    terminal_clone.lock().unwrap().flush();
+                    last_flush = Instant::now();
+                }
+            });
+
+            let mut evdev = Device::open("/dev/input/event0")?;
             loop {
                 for event in evdev.fetch_events()? {
-                    if let EventSummary::Key(_, code, press) = event.destructure() {
-                        if let Ok(keymap) =
-                            KeyMap::from_key_mapping(keycode::KeyMapping::Evdev(code.code()))
-                        {
-                            let mut term = terminal.lock().unwrap();
+                    let EventSummary::Key(_, code, press) = event.destructure() else {
+                        continue;
+                    };
 
-                            let mut scancode = keymap.win;
-                            if press == 0 {
-                                scancode += 0x80;
-                            }
+                    let key = keycode::KeyMapping::Evdev(code.code());
+                    let Ok(keymap) = KeyMap::from_key_mapping(key) else {
+                        continue;
+                    };
 
-                            if scancode >= 0xe000 {
-                                term.handle_keyboard(0xe0);
-                                scancode -= 0xe000;
-                            }
-
-                            term.handle_keyboard(scancode as u8);
-                            term.flush();
-                        }
+                    let mut term = terminal.lock().unwrap();
+                    let mut scancode = keymap.win;
+                    if press == 0 {
+                        scancode += 0x80;
                     }
+
+                    if scancode >= 0xe000 {
+                        term.handle_keyboard(0xe0);
+                        scancode -= 0xe000;
+                    }
+
+                    term.handle_keyboard(scancode as u8);
+                    let _ = flush_sender.send(());
                 }
             }
         }
