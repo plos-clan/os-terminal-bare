@@ -1,13 +1,13 @@
 use crate::backends::Display;
 use anyhow::{Context, Result};
-use evdev::{Device, EventSummary};
+use evdev::{Device, EventSummary, RelativeAxisCode};
 use keycode::KeyMap;
 use nix::errno::Errno;
 use nix::libc::{TIOCSWINSZ, ioctl};
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::unistd::{execvp, read, write};
-use os_terminal::Terminal;
 use os_terminal::font::TrueTypeFont;
+use os_terminal::{MouseInput, Terminal};
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::mpsc::channel;
@@ -121,9 +121,10 @@ fn main() -> Result<()> {
                 }
             });
 
-            let mut evdev = Device::open("/dev/input/event0")?;
+            let mut kbd_evdev = Device::open("/dev/input/event0")?;
+            let mut mouse_evdev_option = Device::open("/dev/input/event1").ok();
             loop {
-                for event in evdev.fetch_events()? {
+                for event in kbd_evdev.fetch_events()? {
                     let EventSummary::Key(_, code, press) = event.destructure() else {
                         continue;
                     };
@@ -133,12 +134,12 @@ fn main() -> Result<()> {
                         continue;
                     };
 
-                    let mut term = terminal.lock().unwrap();
                     let mut scancode = keymap.win;
                     if press == 0 {
                         scancode += 0x80;
                     }
 
+                    let mut term = terminal.lock().unwrap();
                     if scancode >= 0xe000 {
                         term.handle_keyboard(0xe0);
                         scancode -= 0xe000;
@@ -146,6 +147,24 @@ fn main() -> Result<()> {
 
                     term.handle_keyboard(scancode as u8);
                     let _ = flush_sender.send(());
+                }
+
+                let Some(ref mut mouse_evdev) = mouse_evdev_option else {
+                    continue;
+                };
+
+                for event in mouse_evdev.fetch_events()? {
+                    let EventSummary::RelativeAxis(_, code, value) = event.destructure() else {
+                        continue;
+                    };
+
+                    if code == RelativeAxisCode::REL_WHEEL {
+                        terminal
+                            .lock()
+                            .unwrap()
+                            .handle_mouse(MouseInput::Scroll(value as isize));
+                        let _ = flush_sender.send(());
+                    }
                 }
             }
         }
